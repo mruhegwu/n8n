@@ -1,0 +1,129 @@
+name: 'Benchmark: Microbenchmarks'
+
+on:
+  pull_request:
+    paths:
+      - 'packages/workflow/**'
+      - 'packages/core/**'
+      - 'packages/testing/performance/**'
+  push:
+    branches:
+      - master
+
+jobs:
+  microbenchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build dependencies
+        run: pnpm --filter=n8n-workflow build
+
+      - name: Download previous baseline
+        id: download-baseline
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: benchmark-baseline-${{ runner.os }}-${{ runner.arch }}
+          path: packages/testing/performance/profiles/
+
+      - name: Run benchmarks
+        id: run-benchmarks
+        run: |
+          if [ -f packages/testing/performance/profiles/baseline.json ]; then
+            echo "Running with regression check..."
+            pnpm --filter=@n8n/performance bench:ci
+          else
+            echo "No baseline found, running benchmarks without comparison..."
+            pnpm --filter=@n8n/performance bench
+            # Create baseline for next run
+            pnpm --filter=@n8n/performance bench:baseline
+          fi
+
+      - name: Upload new baseline
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-baseline-${{ runner.os }}-${{ runner.arch }}
+          path: packages/testing/performance/profiles/baseline.json
+          retention-days: 90
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: packages/testing/performance/profiles/benchmark-results.json
+          retention-days: 30
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const resultsPath = 'packages/testing/performance/profiles/benchmark-results.json';
+
+            if (!fs.existsSync(resultsPath)) {
+              console.log('No results file found');
+              return;
+            }
+
+            const results = JSON.parse(fs.readFileSync(resultsPath, 'utf-8'));
+            let comment = '## 📊 Benchmark Results\n\n';
+
+            comment += '| Benchmark | Operations/sec |\n';
+            comment += '|-----------|----------------|\n';
+
+            for (const file of results.files) {
+              for (const group of file.groups) {
+                for (const bench of group.benchmarks) {
+                  comment += `| ${bench.name} | ${bench.hz.toFixed(0)} hz |\n`;
+                }
+              }
+            }
+
+            comment += '\n_Run ID: ${{ github.sha }}_';
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existingComment = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('📊 Benchmark Results')
+            );
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: comment,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment,
+              });
+            }
